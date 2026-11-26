@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Nhận mã nguồn · Code2Img</title>
+  <style>
+    :root { color-scheme: light; font-family: system-ui, sans-serif; color: #172b26; background: #f0f4ee; }
+    * { box-sizing: border-box; }
+    body { margin: 0; padding: clamp(1rem, 5vw, 4rem); }
+    main { max-width: 36rem; margin: auto; }
+    h1 { margin: 0; font-size: clamp(2rem, 7vw, 3.25rem); line-height: 1.1; letter-spacing: -.055em; }
+    p { line-height: 1.5; }
+    section { margin-top: 1.5rem; padding: clamp(1rem, 4vw, 1.5rem); background: #fff; border: 1px solid #cbd8ce; border-radius: 1.25rem; }
+    label[for="paste"] { display: block; font-weight: 650; margin-bottom: .5rem; }
+    textarea { display: block; width: 100%; min-height: 6rem; padding: 1rem; color: inherit; background: #f6faf6; border: 1px dashed #628275; border-radius: .75rem; resize: vertical; font: inherit; }
+    .actions { display: flex; flex-wrap: wrap; gap: .625rem; margin-top: .875rem; }
+    button { min-height: 44px; padding: .55rem 1rem; border: 1px solid #789b8c; border-radius: .6rem; background: #fff; color: inherit; font: inherit; font-weight: 650; cursor: pointer; }
+    button:hover { background: #eef6ef; }
+    button:disabled { cursor: default; opacity: .5; }
+    #download:not(:disabled) { background: #104936; border-color: #104936; color: #fff; }
+    progress { display: block; width: 100%; height: .75rem; margin-top: 1.25rem; accent-color: #21664c; }
+    #count { margin: .5rem 0 0; font-weight: 650; }
+    #missing, #status { margin: .35rem 0 0; font-size: .9rem; overflow-wrap: anywhere; }
+    #status[data-error="true"] { color: #a32926; }
+    #status:empty, #missing:empty { display: none; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Nhận mã nguồn</h1>
+    <p>Dán, chụp hoặc chọn ảnh tổng hợp Code2Img để tải ZIP. Bạn cũng có thể thêm các ảnh QR riêng theo bất kỳ thứ tự nào.</p>
+    <section aria-label="Khôi phục mã nguồn từ ảnh QR">
+      <label for="paste">Dán ảnh QR</label>
+      <textarea id="paste" placeholder="Ctrl / ⌘ + V hoặc nhấn giữ để dán ảnh"></textarea>
+      <input type="file" id="files" accept="image/*,.heic,.heif" multiple hidden>
+      <input type="file" id="camera" accept="image/*" capture="environment" hidden>
+      <div class="actions">
+        <button type="button" id="choose">Chọn ảnh</button>
+        <button type="button" id="capture">Chụp ảnh</button>
+      </div>
+      <progress id="progress" value="0" max="1" aria-label="Tiến độ nhận ảnh QR"></progress>
+      <p id="count" aria-live="polite">Chưa có ảnh QR</p>
+      <p id="missing"></p>
+      <p id="status" role="status"></p>
+      <div class="actions">
+        <button type="button" id="download" disabled>Tải ZIP</button>
+        <button type="button" id="reset" disabled>Xóa bộ ảnh</button>
+      </div>
+    </section>
+  </main>
+  <script>
+    const paste = document.querySelector('#paste');
+    const files = document.querySelector('#files');
+    const camera = document.querySelector('#camera');
+    const choose = document.querySelector('#choose');
+    const capture = document.querySelector('#capture');
+    const progress = document.querySelector('#progress');
+    const count = document.querySelector('#count');
+    const missing = document.querySelector('#missing');
+    const status = document.querySelector('#status');
+    const download = document.querySelector('#download');
+    const reset = document.querySelector('#reset');
+    const parts = new Map();
+    let transferId = '';
+    let total = 0;
+    let busy = false;
+
+    function showStatus(message, error = false) {
+      status.textContent = message;
+      status.dataset.error = error;
+    }
+
+    function render() {
+      progress.max = total || 1;
+      progress.value = parts.size;
+      count.textContent = total ? `Đã nhận ${parts.size} / ${total} phần QR` : 'Chưa có ảnh QR';
+      const next = [];
+      for (let number = 1; number <= total && next.length < 8; number++) {
+        if (!parts.has(number)) next.push(number);
+      }
+      const more = total - parts.size > next.length ? ', …' : '';
+      missing.textContent = next.length ? `Còn thiếu số ${next.join(', ')}${more}` : '';
+      choose.disabled = busy;
+      capture.disabled = busy;
+      download.disabled = busy || !total || parts.size !== total;
+      reset.disabled = busy || !total;
+    }
+
+    async function post(path, body, contentType) {
+      const response = await fetch(path, {method: 'POST', headers: {'Content-Type': contentType}, body});
+      if (!response.ok) {
+        const result = await response.json();
+        throw new Error(result.error);
+      }
+      return response;
+    }
+
+    function record(part) {
+      if (total && (part.id !== transferId || part.total !== total)) {
+        throw new Error('Ảnh QR thuộc bộ truyền khác.');
+      }
+      if (parts.has(part.number) && parts.get(part.number) !== part.payload) {
+        throw new Error(`Nội dung QR số ${part.number} bị mâu thuẫn.`);
+      }
+      transferId = part.id;
+      total = part.total;
+      parts.set(part.number, part.payload);
+    }
+
+    async function addImages(images) {
+      if (!images.length) return;
+      if (busy) {
+        showStatus('Đang xử lý. Hãy dán ảnh lại khi thao tác hoàn tất.', true);
+        return;
+      }
+      busy = true;
+      render();
+      const failures = [];
+      const before = parts.size;
+      for (const [index, image] of images.entries()) {
+        showStatus(`Đang đọc ảnh ${index + 1} / ${images.length}…`);
+        try {
+          const response = await post('/scan', image, 'application/octet-stream');
+          const result = await response.json();
+          for (const part of result.parts) record(part);
+        } catch (error) {
+          failures.push(`${image.name || 'Ảnh dán'} — ${error.message}`);
+        }
+        render();
+      }
+      busy = false;
+      render();
+      const added = parts.size - before;
+      if (failures.length) {
+        const more = failures.length > 3 ? ` (+${failures.length - 3} ảnh khác)` : '';
+        showStatus(`Đã thêm ${added} phần. ${failures.slice(0, 3).join(' ')}${more}`, true);
+      } else {
+        showStatus(added ? `Đã thêm ${added} phần.` : 'Các phần QR này đã có trong bộ ảnh.');
+      }
+    }
+
+    choose.addEventListener('click', () => files.click());
+    capture.addEventListener('click', () => camera.click());
+    for (const input of [files, camera]) {
+      input.addEventListener('change', () => {
+        const images = [...input.files];
+        input.value = '';
+        addImages(images);
+      });
+    }
+    document.addEventListener('paste', (event) => {
+      const clipboard = event.clipboardData;
+      const images = Array.from(clipboard?.files || []).filter(file => file.type.startsWith('image/'));
+      if (!images.length && clipboard?.items) {
+        for (const item of clipboard.items) {
+          if (item.kind === 'file' && item.type.startsWith('image/')) {
+            const file = item.getAsFile();
+            if (file) images.push(file);
+          }
+        }
+      }
+      if (!images.length && event.target !== paste) return;
+      event.preventDefault();
+      if (images.length) addImages(images);
+      else showStatus('Không có ảnh trong clipboard. Hãy chọn ảnh từ thiết bị.', true);
+    });
+    paste.addEventListener('input', () => { paste.value = ''; });
+    reset.addEventListener('click', () => {
+      parts.clear();
+      transferId = '';
+      total = 0;
+      showStatus('');
+      render();
+    });
+    download.addEventListener('click', async () => {
+      busy = true;
+      render();
+      showStatus('Đang kiểm tra SHA-256 và chuẩn bị ZIP…');
+      try {
+        const response = await post('/restore', JSON.stringify([...parts.values()]), 'application/json');
+        const url = URL.createObjectURL(await response.blob());
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = 'code2img.zip';
+        document.body.append(link);
+        link.click();
+        link.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 30000);
+        showStatus('ZIP đã được kiểm tra và sẵn sàng trong mục tải xuống.');
+      } catch (error) {
+        showStatus(error.message, true);
+      } finally {
+        busy = false;
+        render();
+      }
+    });
+  </script>
+</body>
+</html>
